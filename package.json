@@ -8,13 +8,19 @@
     "dev": "nodemon server.js"
   },
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^4.18.2",
     "mysql2": "^3.6.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
   },
-  "keywords": ["webhook", "payment", "telegram", "bot"],
+  "keywords": [
+    "webhook",
+    "payment",
+    "telegram",
+    "bot"
+  ],
   "author": "Snorrel Bot",
   "license": "MIT"
 }

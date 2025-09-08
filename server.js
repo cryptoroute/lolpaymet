@@ -32,8 +32,6 @@ class WebhookServer {
       database: process.env.DB_NAME || "s2714_Snorrel",
       port: process.env.DB_PORT || 3306,
       connectionLimit: 10,
-      acquireTimeout: 60000,
-      timeout: 60000,
     }
 
     this.pool = mysql.createPool(this.dbConfig)
@@ -117,6 +115,10 @@ class WebhookServer {
     try {
       console.log(`Processing payment callback: ${orderId}, status: ${status}`)
 
+      // normalize undefined → null
+      txid = txid || null
+      confirmations = confirmations || 0
+
       // Get payment details from database
       const [payments] = await this.pool.execute("SELECT * FROM payments WHERE order_id = ?", [orderId])
 
@@ -128,44 +130,18 @@ class WebhookServer {
       const payment = payments[0]
 
       if (status === "confirmed" && confirmations >= 1) {
-        // Payment confirmed - activate user plan
-        const isUpgrade = payment.is_upgrade === 1
+        const sessionAssigned = await this.assignSessionToUser(payment.telegram_id)
 
-        if (isUpgrade) {
-          // For upgrades, only update the plan name to Advanced
-          await this.pool.execute("UPDATE users SET plan_name = ? WHERE telegram_id = ?", [
-            "Advanced",
-            payment.telegram_id,
-          ])
-          console.log(`User ${payment.telegram_id} plan upgraded to Advanced`)
-        } else {
-          // Regular payment - update both plan and expiry
-          await this.updateUserPlan(payment.telegram_id, payment.plan_name, payment.duration)
-          console.log(`User ${payment.telegram_id} plan activated: ${payment.plan_name} for ${payment.duration}`)
-        }
+        await this.pool.execute("UPDATE payments SET status = ? WHERE order_id = ?", ["completed", orderId])
 
-        // Update payment status
-        await this.pool.execute("UPDATE payments SET status = ?, txid = ?, confirmed_at = NOW() WHERE order_id = ?", [
-          "completed",
-          txid,
-          orderId,
-        ])
+        // Update user plan
+        await this.updateUserPlan(payment.telegram_id, payment.plan_name, payment.duration)
 
-        // Send notification to bot
-        await this.notifyBot(payment, txid, isUpgrade)
-
+        await this.notifyBot(payment, txid, false, sessionAssigned)
         return { success: true, message: "Payment confirmed and user activated" }
       } else if (status === "pending_confirmation") {
-        // Update payment status to pending
-        await this.pool.execute("UPDATE payments SET status = ?, txid = ? WHERE order_id = ?", [
-          "pending",
-          txid,
-          orderId,
-        ])
-
-        // Send pending notification to bot
+        await this.pool.execute("UPDATE payments SET status = ? WHERE order_id = ?", ["pending", orderId])
         await this.notifyBotPending(payment, txid)
-
         return { success: true, message: "Payment pending confirmation" }
       }
 
@@ -173,6 +149,38 @@ class WebhookServer {
     } catch (error) {
       console.error("Payment callback error:", error)
       return { success: false, error: error.message }
+    }
+  }
+
+  async assignSessionToUser(telegramId) {
+    try {
+      // Get an available session (not claimed)
+      const [sessions] = await this.pool.execute("SELECT * FROM sessions WHERE claimed_by IS NULL LIMIT 1")
+
+      if (sessions.length === 0) {
+        console.warn(`No available sessions for user ${telegramId}`)
+        return null
+      }
+
+      const session = sessions[0]
+
+      // Assign session to user
+      await this.pool.execute("UPDATE sessions SET claimed_by = ?, claimed_at = NOW() WHERE id = ?", [
+        telegramId,
+        session.id,
+      ])
+
+      // Update user with session
+      await this.pool.execute("UPDATE users SET session_string = ? WHERE telegram_id = ?", [
+        session.session_string,
+        telegramId,
+      ])
+
+      console.log(`Assigned session ${session.id} to user ${telegramId}`)
+      return session.session_string
+    } catch (error) {
+      console.error("Error assigning session:", error)
+      return null
     }
   }
 
@@ -220,9 +228,9 @@ class WebhookServer {
     }
   }
 
-  async notifyBot(payment, txid, isUpgrade = false) {
+  async notifyBot(payment, txid, isUpgrade = false, sessionAssigned = null) {
     try {
-      const botToken = process.env.BOT_TOKEN
+      const botToken = process.env.BOT_TOKEN || "8452634439:AAFw4HfNC6ClNOQmEsXBrMsC60fax_lp88E"
       if (!botToken) {
         console.warn("BOT_TOKEN not set, skipping bot notification")
         return
@@ -244,6 +252,10 @@ class WebhookServer {
           `*Support:* @Snorrel`
       } else {
         const expiryDate = this.calculateExpiry(payment.duration)
+        const sessionInfo = sessionAssigned
+          ? `\n• Session: Automatically assigned`
+          : `\n• Session: Will be assigned shortly`
+
         message =
           `✅ *Payment Confirmed!*\n\n` +
           `🎉 Your ${payment.plan_name} plan has been activated!\n\n` +
@@ -251,7 +263,7 @@ class WebhookServer {
           `• Plan: ${payment.plan_name}\n` +
           `• Duration: ${payment.duration}\n` +
           `• Expires: ${expiryDate.toLocaleDateString()}\n` +
-          `• Transaction ID: \`${txid}\`\n\n` +
+          `• Transaction ID: \`${txid}\`${sessionInfo}\n\n` +
           `🚀 Your account is now active and ready to use!\n\n` +
           `*Support:* @Snorrel`
       }
@@ -278,19 +290,22 @@ class WebhookServer {
 
   async notifyBotPending(payment, txid) {
     try {
-      const botToken = process.env.BOT_TOKEN
+      const botToken = process.env.BOT_TOKEN || "8452634439:AAFw4HfNC6ClNOQmEsXBrMsC60fax_lp88E"
       if (!botToken) {
         console.warn("BOT_TOKEN not set, skipping bot notification")
         return
       }
 
+      const amount = payment.amount ?? "Unknown"
+      const currency = (payment.crypto_type ?? "crypto").toUpperCase()
+
       const message =
         `*Payment Received - Pending Confirmation*\n\n` +
         `We've received your payment and it's being confirmed on the blockchain.\n\n` +
         `*Details:*\n` +
-        `• Amount: ${payment.crypto_amount} ${payment.crypto_type.toUpperCase()}\n` +
-        `• Plan: ${payment.plan_name} (${payment.duration})\n` +
-        `• Transaction ID: \`${txid}\`\n\n` +
+        `• Amount: ${amount} ${currency}\n` +
+        `• Plan: ${payment.plan_name || "Unknown"} (${payment.duration || "Unknown"})\n` +
+        `• Transaction ID: \`${txid || "N/A"}\`\n\n` +
         `Your plan will be activated automatically once confirmed!\n\n` +
         `*Support:* @Snorrel`
 
